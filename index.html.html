@@ -1,0 +1,1752 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: the comment bubble itself (a 24px white teardrop,
+  // tail tip bottom-left = the hotspot), drawn by the browser so it has no
+  // lag; the host paints only the inspector box and, on click, the pin.
+  // Same glyph as the host's pins (size-6 rounded-full rounded-bl-[2px]);
+  // cursor images take no CSS shadow, so a slightly stronger 1px ring
+  // stands in for ring + shadow. SVG first (rasterised at device scale
+  // where supported), the same glyph as a 24px PNG for engines without
+  // SVG cursors (WebKit), then the arrow.
+  var BUBBLE_SVG =
+    "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>" +
+    "<path d='M12 .5h0A11.5 11.5 0 0 1 23.5 12v0A11.5 11.5 0 0 1 12 23.5H2.5a2 2 0 0 1-2-2V12A11.5 11.5 0 0 1 12 .5Z' fill='#fff' stroke='rgba(0,0,0,0.22)' stroke-width='1'/>" +
+    "</svg>";
+  var BUBBLE_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC";
+  var BUBBLE_CURSOR =
+    "url(\"data:image/svg+xml," + encodeURIComponent(BUBBLE_SVG) + "\") 1 23, " +
+    "url(\"" + BUBBLE_PNG + "\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "8128e0b1-2f43-40db-97d9-bded283899a6" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day-Before Study Guide: Seminar on Green Energy for Indonesia (BIOMA, 10–23 Oct 2026)</title>
+<style>
+:root{--bg:#fafaf7;--fg:#1f2933;--muted:#667085;--card:#fff;--line:#e4e7ec;--accent:#1b7f5c;--accent-bg:#e6f4ee;--warn:#fff7e0;--id:#fdecea;--idb:#c0392b;--q:#eaf1fb;--qb:#2f6fb5}
+@media (prefers-color-scheme:dark){:root{--bg:#14181c;--fg:#e6e8eb;--muted:#9aa4b2;--card:#1c2228;--line:#2d353d;--accent:#4fc89b;--accent-bg:#1b2f28;--warn:#2d2a18;--id:#33201e;--idb:#e8776b;--q:#1c2733;--qb:#6fa8e0}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:70px}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#bar{position:sticky;top:0;z-index:10;background:var(--card);border-bottom:1px solid var(--line);padding:8px 14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#bar button,#bar select{font:inherit;font-size:14px;padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer}
+#bar button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+#status{font-size:13px;color:var(--muted);margin-left:auto}
+main{max-width:860px;margin:0 auto;padding:20px 16px 80px}
+#doc{outline:none}
+body.editing #doc{outline:2px dashed var(--accent);outline-offset:8px;border-radius:6px}
+h1{font-size:1.7rem;line-height:1.25;margin:.5em 0}
+h2{font-size:1.25rem;margin:2.2em 0 .6em;padding:10px 12px;background:var(--accent-bg);border-left:4px solid var(--accent);border-radius:6px}
+h2 .done{width:18px;height:18px;vertical-align:-3px;margin-right:6px;accent-color:var(--accent)}
+h2:has(.done:checked){opacity:.55}
+h3{font-size:1.05rem;margin:1.4em 0 .4em;color:var(--accent)}
+blockquote{margin:1em 0;padding:8px 14px;background:var(--warn);border-radius:6px;border-left:4px solid #e0a800}
+.id{margin:1em 0;padding:8px 14px;background:var(--id);border-radius:6px;border-left:4px solid var(--idb)}
+.id strong:first-child{color:var(--idb)}
+.q{margin:1em 0;padding:8px 14px;background:var(--q);border-radius:6px;border-left:4px solid var(--qb)}
+.q strong:first-child{color:var(--qb)}
+.id ul,.q ul{margin:.3em 0}
+hr{border:0;border-top:1px solid var(--line);margin:2em 0}
+li{margin:.25em 0}
+.tw{overflow-x:auto;margin:1em 0}
+table{border-collapse:collapse;width:100%;font-size:.92rem}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top;min-width:70px}
+th{background:var(--accent-bg)}
+@media print{#bar{display:none}body{background:#fff;color:#000}main{max-width:none}}
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body id="artifacts-component-root-html">
+<div id="bar">
+  <button id="editBtn" type="button">✏️ Edit mode: OFF</button>
+  <select id="jump" aria-label="Jump to day"><option value="">Jump to day…</option><option value="sec0">0. General Strategy (read once, apply daily)</option><option value="sec1">TONIGHT (Fri, 9 Oct) → for Sat, 10 Oct</option><option value="sec2">Saturday night (10 Oct) → for Sun, 11 Oct</option><option value="sec3">Sunday night (11 Oct) → for Mon, 12 Oct</option><option value="sec4">Monday night (12 Oct) → for Tue, 13 Oct</option><option value="sec5">Tuesday night (13 Oct) → for Wed, 14 Oct</option><option value="sec6">Wednesday night (14 Oct) → for Thu, 15 Oct</option><option value="sec7">Thursday night (15 Oct) → for Fri, 16 Oct</option><option value="sec8">Friday night (16 Oct) → for Sat, 17 Oct</option><option value="sec9">Saturday night (17 Oct) → Sun, 18 Oct (Free Time) &amp; Monday p</option><option value="sec10">Sunday night (18 Oct) → for Mon, 19 Oct</option><option value="sec11">Monday night (19 Oct) → for Tue, 20 Oct</option><option value="sec12">Tuesday night (20 Oct) → for Wed, 21 Oct</option><option value="sec13">Wednesday night (21 Oct) → for Thu, 22 Oct</option><option value="sec14">Thursday night (22 Oct) → for Fri, 23 Oct</option><option value="sec15">Appendix A: Quick Glossary (English, Indonesian, Chinese)</option><option value="sec16">Appendix B: Quick Formulas &amp; Figures</option></select>
+  <button id="saveBtn" type="button">💾 Download HTML</button>
+  <button id="resetBtn" type="button">↩️ Reset</button>
+  <span id="status">Changes autosave in this browser</span>
+</div>
+<main><article id="doc">
+<h1>Day-Before Study Guide: Seminar on Green Energy for Indonesia (BIOMA, 10–23 October 2026)</h1>
+<p>Built from the official schedule (Session 227). Each day has one <strong>"Read the evening before"</strong> block (target 1–2 hours) for the next day's activities: key points, terminology, <span style="color:var(--idb)"><strong>comparison with Indonesia and the Ministry of Energy and Mineral Resources (MoEMR/ESDM)</strong></span>, and <span style="color:var(--qb)"><strong>discussion questions</strong></span> to raise in each session.</p>
+<blockquote><p><strong>Accuracy note:</strong> figures are approximate, from general knowledge. Always cross-check against the lecturers' materials and the latest official MoEMR data (e.g., Handbook of Energy &amp; Economic Statistics, RUPTL, ministerial regulations). If the lecturer's number differs, record theirs with the source.</p></blockquote>
+<hr>
+
+<h2 id="sec0"><input type="checkbox" class="done" title="Mark as read"> 0. General Strategy (read once, apply daily)</h2>
+<p><strong>Daily routine</strong></p>
+<ol>
+<li><strong>Evening before (60–120 min):</strong> read the next day's block, write 3 questions of your own, prepare one "comparison with Indonesia".</li>
+<li><strong>During class:</strong> take notes in 3 columns: <em>Facts/figures</em> | <em>Mechanism/technology</em> | <em>Relevance to Indonesia/MoEMR</em>.</li>
+<li><strong>After class (15 min):</strong> write a 5-line summary and 1 idea applicable to your unit/region.</li>
+<li><strong>Photograph slides</strong> (if permitted) and collect lecturers' contacts.</li>
+</ol>
+<p><strong>One-page note template:</strong> Topic &amp; speaker · 3 key points · Key figures (capacity, cost, efficiency, price) · Policies/regulations mentioned · What is applicable in Indonesia and what are the barriers? · Unanswered questions.</p>
+<p><strong>How to ask questions like an expert</strong></p>
+<ul>
+<li>Start with context: <em>"In Indonesia we face X. How did you address it in China?"</em></li>
+<li>Ask for <strong>numbers</strong>: cost per kWp / per m³ biogas / per tonne of waste, payback, tariffs, subsidies.</li>
+<li>Ask about <strong>failures and lessons learned</strong>: <em>"What did not work, and why?"</em></li>
+<li>Ask about <strong>business model &amp; institutions</strong>: who finances, who operates, how long-term maintenance is ensured.</li>
+</ul>
+<p><strong>Practical notes</strong></p>
+<ul>
+<li><strong>Halal:</strong> request halal food (清真 <em>qīngzhēn</em>) from organizers early, especially for banquets and field visits; ask about prayer space/time.</li>
+<li><strong>Payments/apps:</strong> Alipay/WeChat Pay can link to international cards; carry some cash. Google and many Western apps do not work normally without an eSIM/international roaming.</li>
+<li><strong>China emergency numbers:</strong> police 110, ambulance 120, fire 119, traffic 122.</li>
+<li>Bring: passport (always), jacket (Chengdu is damp and cool in October; Kunming is cool), comfortable field shoes, power bank, adapter, personal medication, business cards.</li>
+<li><strong>Schedule note:</strong> the schedule title says up to 23 Oct, but a 24 Oct departure transfer is listed. Confirm your return ticket.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR frame for the whole trip:</strong> Indonesia's targets are Net Zero Emission by 2060 (or earlier), a 23% renewable share in the national energy mix by 2025 (not met; realization is roughly 13–15%, verify), and the JETP partnership (US$20 billion). The recurring question: <em>which Chinese mechanisms could MoEMR adopt, adapt, or avoid?</em></div>
+<hr>
+
+<h2 id="sec1"><input type="checkbox" class="done" title="Mark as read"> TONIGHT (Fri, 9 Oct) → for Sat, 10 Oct</h2>
+<p><strong>Tomorrow:</strong> Ice-breaking, Safety Briefing &amp; Team Building · Lecture 1: <em>China's Basic National Conditions</em> (Zhang Bei) · Opening Ceremony · Welcome Banquet.</p>
+<h3>A. China context (~45 min)</h3>
+<ul>
+<li><strong>Geography &amp; demography:</strong> ~9.6 million km² (similar to Europe), ~1.4 billion people, 56 ethnic groups (Han ~91%). 34 provincial-level divisions: 23 provinces, 5 autonomous regions, 4 municipalities, 2 Special Administrative Regions.</li>
+<li><strong>Sichuan &amp; Chengdu:</strong> Sichuan has ~83 million people; Chengdu (~21 million) is the capital and the southwest hub. Symbols: giant panda, spicy cuisine (麻辣 <em>málà</em>), Dujiangyan.</li>
+<li><strong>Political system:</strong> Communist Party leads; National People's Congress (legislature); State Council (central government). Policy is set through <strong>Five-Year Plans (五年规划)</strong>: the 14th (2021–2025) just ended and the 15th (2026–2030) has begun, the key to understanding energy direction.</li>
+<li><strong>Economy:</strong> second-largest economy, "factory of the world", urbanization ~65%. <strong>Rural revitalization (乡村振兴)</strong> is a national agenda linked to rural renewables such as biogas.</li>
+<li><strong>Energy:</strong> world's largest energy consumer, still heavily coal-dependent (~55–60% of primary energy), yet also the largest producer of solar, wind, hydropower, batteries and EVs.</li>
+<li><strong>"Dual Carbon" (双碳) targets:</strong> CO₂ peak <strong>before 2030</strong>, carbon neutrality <strong>before 2060</strong>; the "1+N" policy framework.</li>
+<li><strong>Link to Indonesia:</strong> major trade and investment partner; Belt and Road / Green Silk Road; nickel, EV battery and solar investments.</li>
+</ul>
+<h3>B. Ice-breaking &amp; team building (~15 min)</h3>
+<ul>
+<li>Prepare a <strong>60-second introduction</strong>: name, institution, duties, one energy problem in your region, one thing you want to learn.</li>
+<li>Prepare one unique Indonesian fact (e.g., Indonesia holds roughly 40% of the world's geothermal resources, or the household biogas programme).</li>
+<li>Ask other participants about their country/institution/field and note names for networking.</li>
+</ul>
+<h3>C. Etiquette, banquet &amp; safety (~15 min)</h3>
+<ul>
+<li>Greetings: <em>"Xièxie"</em> (谢谢, thank you), <em>"Nǐ hǎo"</em> (你好), <em>"Gān bēi"</em> (干杯, cheers; tea or water is fine if you do not drink alcohol).</li>
+<li>Round-table dining: senior hosts take the seat of honor; never stick chopsticks upright in a bowl; dishes rotate clockwise.</li>
+<li><strong>Sichuan = hot and numbing (麻辣).</strong> Not spicy: <em>"Bú yào là"</em> (不要辣). Halal: <em>"Qīngzhēn"</em> (清真).</li>
+<li>Note evacuation routes, organizer emergency contacts and field-activity rules.</li>
+</ul>
+<h3>D. Personal agenda</h3>
+<ul><li>Write <strong>3 personal goals</strong> for the 14 days (e.g., "Get a community biogas business model", "Meet 5 experts", "Draft a project proposal for my region").</li></ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Planning:</strong> China steers via Five-Year Plans; Indonesia via RPJMN, the national energy policy (KEN/RUEN) and the electricity plan (RUPTL), the last managed by MoEMR with PLN. Compare how binding each is.</li>
+<li><strong>Coal dependence:</strong> both countries are coal-heavy. Indonesia is a major coal exporter and its power sector is still ~60% coal; MoEMR's task is to balance supply security with coal phase-down (Perpres 112/2022).</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>How do Five-Year Plan targets translate into provincial and local implementation, and what happens if a province misses them?</li>
+<li>Where do rural energy issues sit in China's overall development agenda compared with urban/industrial energy?</li>
+<li>What did China learn from earlier coal-heavy growth that Southeast Asian countries could avoid?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec2"><input type="checkbox" class="done" title="Mark as read"> Saturday night (10 Oct) → for Sun, 11 Oct</h2>
+<p><strong>Tomorrow:</strong> Field Visit 1: <em>Dujiangyan, Water Energy Efficient Utilization &amp; Carbon Neutralization</em> · Cultural Experience 1: <em>Chengdu Giant Panda Garden</em>.</p>
+<h3>A. Dujiangyan (~45 min)</h3>
+<ul>
+<li><strong>History:</strong> built around <strong>256 BCE</strong> by Li Bing (李冰) in the Qin era. <strong>No dam</strong>: nature-aligned engineering still working after 2,200+ years. UNESCO World Heritage (2000) with Mount Qingcheng.</li>
+<li><strong>Three key components:</strong> (1) <strong>Yuzui (鱼嘴, "fish mouth")</strong> splits the Min River into an inner (irrigation) and an outer (flood) channel; (2) <strong>Feishayan (飞沙堰)</strong> spillway discharges silt and excess flood water; (3) <strong>Baopingkou (宝瓶口, "bottle neck")</strong> regulates flow to the Chengdu Plain.</li>
+<li><strong>Key principles:</strong> work with nature, sediment management, flood control + irrigation + transport together. The plain became "Tianfu Zhi Guo" (天府之国, land of abundance).</li>
+<li><strong>Energy link:</strong> Sichuan is China's largest hydropower province (&gt;100 GW incl. Baihetan ~16 GW and Xiluodu ~13.9 GW on the Jinsha River), a base for <strong>"West-to-East power transmission" (西电东送)</strong>.</li>
+<li><strong>Water-energy-food nexus:</strong> a useful lens for the visit.</li>
+</ul>
+<h3>B. Water-energy efficiency &amp; carbon neutrality (~30 min)</h3>
+<ul>
+<li>Revisit run-of-river vs reservoir hydro, mini/micro hydro (<strong>PLTMH</strong> for Indonesian villages), hydro capacity factor (~40–50%).</li>
+<li>Carbon neutrality: sources, sinks (forest, soil, ocean), offsets, <strong>carbon markets</strong>. China launched its national ETS in 2021 (power sector, later extended to steel, cement, aluminium).</li>
+</ul>
+<h3>C. Panda Garden (~15 min)</h3>
+<ul>
+<li>IUCN status <strong>Vulnerable</strong> (downlisted from Endangered in 2016); wild population ~1,800+. Panda conservation illustrates <strong>ecological civilization</strong> (生态文明), the Monday topic.</li>
+<li>Indonesia link: two pandas (Cai Tao &amp; Hu Chun) live at Taman Safari Indonesia since 2017.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Hydropower:</strong> Indonesia's hydro potential is ~95 GW but only a small share is developed (verify). MoEMR promotes both large hydro (e.g., Upper Cisokan pumped storage, Batang Toru, Kayan) and PLTMH/PLTM for remote villages.</li>
+<li><strong>Carbon pricing:</strong> Indonesia has IDXCarbon (launched 2023), the carbon-tax framework and Perpres 98/2021 on carbon economic value; MoEMR runs the power-sector emission trading (PTBAE-PU) pilot. Compare with China's ETS design.</li>
+<li><strong>Traditional water wisdom:</strong> Subak irrigation in Bali (UNESCO 2012) parallels Dujiangyan.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>How is Dujiangyan operated today (digitalization, ecotourism, maintenance funding)?</li>
+<li>How is water allocated among irrigation, cities and hydropower, and who arbitrates conflicts?</li>
+<li>What lessons does a dam-free, ecosystem-aligned design offer for Indonesia's run-of-river and micro-hydro planning?</li>
+<li>How does the ETS price signal actually reach hydro and other clean generators?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec3"><input type="checkbox" class="done" title="Mark as read"> Sunday night (11 Oct) → for Mon, 12 Oct</h2>
+<p><strong>Tomorrow:</strong> Lecture 2: <em>Xi Jinping Thought on Ecological Civilization</em> (Wang Qian) · Lecture 3: <em>China's Green Energy Strategy &amp; Policies</em> (Wu Zhenming), both from Sichuan Academy of Social Sciences. The most "policy-heavy" day.</p>
+<h3>A. Ecological Civilization / 生态文明 (~40 min)</h3>
+<ul>
+<li>Written into the constitution (2018) and national strategy. Goal: <strong>"Beautiful China" (美丽中国)</strong>.</li>
+<li><strong>Key phrase:</strong> <em>"Lucid waters and lush mountains are invaluable assets" (绿水青山就是金山银山)</em>: protecting the environment is protecting economic assets.</li>
+<li><strong>Six core principles (2018 national eco-environmental conference):</strong> harmony between humans and nature; green mountains and clear waters as valuable assets; a good environment as the most inclusive public welfare; mountains, waters, forests, farmland, lakes, grasslands and deserts as <strong>one living community (山水林田湖草沙)</strong>; strictest legal system; a shared global community.</li>
+<li><strong>Instruments:</strong> ecological red lines, ecological compensation, carbon markets, central environmental inspections, air and water quality targets.</li>
+<li>Treat the lecture as policy/ideology: capture the concrete frameworks and instruments.</li>
+</ul>
+<h3>B. China's green energy strategy &amp; policy (~45 min)</h3>
+<ul>
+<li><strong>Structure:</strong> Five-Year Plan → sectoral renewable plans → regulations → markets.</li>
+<li><strong>Milestones:</strong> <strong>Renewable Energy Law (2006)</strong> (grid purchase obligation, feed-in tariffs); heavy subsidies 2009–2020 drove the PV/wind boom; then transition to <strong>subsidy-free grid parity</strong> and <strong>auctions/markets</strong> (2025 pricing reform, "Document 136").</li>
+<li><strong>Dual Carbon:</strong> 2030 targets ~25% non-fossil share and ≥1,200 GW wind + solar (reached early, in 2024). <strong>Energy Law</strong> in force 2025.</li>
+<li><strong>2035 NDC (announced 2025):</strong> ~7–10% net emissions cut from peak; non-fossil share &gt;30%; wind + solar ~3,600 GW (verify latest).</li>
+<li><strong>"Build the new before breaking the old" (先立后破):</strong> add clean energy while securing supply; no abrupt coal closure.</li>
+<li><strong>Rural:</strong> village rooftop PV, biogas, clean heating, "rural energy revolution".</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Comparison table (short):</strong> China: Renewable Energy Law 2006 + FiT → auctions/markets. Indonesia: Permen ESDM 50/2017 (later Perpres 112/2022 pricing ceilings), the pending New and Renewable Energy bill (RUU EBET), and PLN's single-buyer structure.</li>
+<li><strong>MoEMR instruments:</strong> KEN/RUEN, NZE roadmap, RUPTL 2025–2034 (greener than predecessors), JETP (US$20 billion), early coal retirement under Perpres 112/2022, the government's 100 GW solar ambition (verify status), and TKDN local-content rules.</li>
+<li><strong>"Build the new before breaking the old"</strong> resembles Indonesia's gradual coal phase-down approach tied to supply security.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>How did China finance this scale of transition, and what were the roles of SOEs versus private firms?</li>
+<li>What is the biggest barrier now: curtailment, grid, storage, or price signals after the end of subsidies?</li>
+<li>Which mechanism could Indonesia copy within 3–5 years, and which would not transfer (state-led planning, land, grid ownership)?</li>
+<li>How are "ecological red lines" enforced when they conflict with energy projects?</li>
+<li>How did removal of subsidies affect investor confidence, and what does it imply for Indonesia's tariff reform?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec4"><input type="checkbox" class="done" title="Mark as read"> Monday night (12 Oct) → for Tue, 13 Oct</h2>
+<p><strong>Tomorrow:</strong> Lecture 4: <em>Development of Rural Renewable Energy Biogas Technology in China</em> (Hu Guoquan) · Lecture 5: <em>Development &amp; Utilization of Biomass Energy in China</em> (He Mingxiong). <strong>This is BIOMA's core competence. Study it most deeply.</strong></p>
+<h3>A. Biogas technology basics (~60 min)</h3>
+<ul>
+<li><strong>Anaerobic digestion (AD), 4 stages:</strong> hydrolysis → acidogenesis → acetogenesis → methanogenesis.</li>
+<li><strong>Composition:</strong> CH₄ 50–70%, CO₂ 30–45%, traces of H₂S, NH₃, water vapor. Heating value ~20–25 MJ/m³. Rule of thumb: 1 m³ biogas ≈ 0.6–0.7 m³ natural gas ≈ 1.5–2 kWh electricity (via genset).</li>
+<li><strong>Operating parameters:</strong> temperature (mesophilic ~35 °C, thermophilic ~55 °C), pH 6.8–7.5, C/N ratio ~20–30:1, HRT, OLR, TS/VS, inhibitors (ammonia, H₂S, volatile fatty acids).</li>
+<li><strong>Digester types:</strong> <em>fixed-dome</em> (Chinese model, 水压式沼气池), <em>floating drum</em> (India), <em>tubular/plastic bag</em> (Latin America), <strong>CSTR</strong>, <strong>UASB</strong>, plug flow, covered lagoon (POME).</li>
+<li><strong>Products:</strong> biogas (cooking, power, CHP), <strong>biomethane</strong> (&gt;95% CH₄ via water scrubbing, PSA, membranes, amine), <strong>digestate</strong> (liquid/solid organic fertilizer).</li>
+</ul>
+<h3>B. History &amp; models of Chinese biogas (~30 min)</h3>
+<ul>
+<li>Mass rural biogas began in the 1970s, especially in <strong>Sichuan</strong>; tens of millions of household digesters (~40 million+), the world's largest rural biogas programme.</li>
+<li>Policy phases: campaign (1970s) → standards &amp; subsidies (2000s) → <strong>medium/large &amp; communal</strong> plants and <strong>biomethane/CNG</strong> (2010s onward).</li>
+<li><strong>Integrated models:</strong> "three-in-one" <strong>pig–biogas–fruit</strong> (south) and "four-in-one" <strong>greenhouse–pigsty–biogas–toilet</strong> (north).</li>
+<li><strong>Standards:</strong> learn how BIOMA acts as a standards, research, training and testing body.</li>
+<li><strong>Challenges:</strong> operation &amp; maintenance, stable feedstock, unused gas, weak business models, digestate management.</li>
+</ul>
+<h3>C. Biomass (~30 min)</h3>
+<ul>
+<li><strong>Sources:</strong> crop residues (straw, husk, bagasse), forest residues, manure, organic waste, energy crops, used cooking oil.</li>
+<li><strong>Conversion routes:</strong> <em>thermochemical</em> (combustion, <strong>gasification</strong>, <strong>pyrolysis/biochar</strong>, torrefaction); <em>biochemical</em> (AD, bioethanol fermentation); <em>physical-chemical</em> (pellets/briquettes, biodiesel, HVO/SAF).</li>
+<li><strong>China:</strong> ~700–800 Mt straw/year, comprehensive utilization &gt;85%; tens of GW biomass power; open straw-burning bans.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Biogas:</strong> the household biogas programme BIRU (Hivos/SNV with the Indonesian government) since 2009 built tens of thousands of digesters; MoEMR's bioenergy directorate (DJ EBTKE) also supports POME-to-biogas/electricity at palm oil mills. Key lesson to test: why do many small digesters stall?</li>
+<li><strong>Biodiesel:</strong> Indonesia is the world leader in mandatory biodiesel: B35 → <strong>B40 (2025)</strong> → B50 plan. MoEMR sets the mandate; BPDP funds the price gap.</li>
+<li><strong>Biomass co-firing</strong> in PLN coal plants (MoEMR/PLN programme) and pellet supply chains.</li>
+<li><strong>Contrast:</strong> China's strength is household/communal and agricultural-residue integration; Indonesia's is palm-based liquid biofuels, with weaker rural biogas O&amp;M.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>What are investment cost per m³ digester (household vs communal), lifetime and biogas production cost?</li>
+<li>What business model and subsidy design prevent digesters from being abandoned? Who funds repairs after year 3?</li>
+<li>What are the success vs failure rates, and the top three causes of failure?</li>
+<li>How is straw pretreatment/co-digestion made economical?</li>
+<li>How is mandatory biofuel/straw-use enforcement handled, and what are the food-vs-fuel and land-use safeguards?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec5"><input type="checkbox" class="done" title="Mark as read"> Tuesday night (13 Oct) → for Wed, 14 Oct</h2>
+<p><strong>Tomorrow (full day 9:00–16:00):</strong> Field Visit 2: <em>Jingyang District Biogas Centralized Gas Supply Project, Deyang</em> (Guo Tangping, Deyang Haoyun Composite Materials Co.). Category: "Underdeveloped area".</p>
+<h3>A. Centralized biogas supply (~50 min)</h3>
+<ul>
+<li><strong>System flow:</strong> feedstock collection (manure/straw/waste) → digester → desulfurization &amp; dehydration → storage tank → <strong>pipeline network</strong> → households (metered) → digestate as fertilizer.</li>
+<li><strong>Advantages:</strong> economies of scale, stable gas quality, professional operators, replaces firewood/LPG. <strong>Challenges:</strong> pipeline cost, feedstock logistics, affordable tariff, long-term management, safety compliance.</li>
+<li><strong>Safety:</strong> methane is explosive at ~5–15% in air; H₂S is toxic; need gas detectors, flame arrestors, ventilation, emergency procedures.</li>
+<li>"Composite Materials" in the company name suggests composite/FRP tanks or components. Ask what its role is (investor, operator, technology supplier?).</li>
+</ul>
+<h3>B. Field observation checklist</h3>
+<ol>
+<li>Scale: digester volume, biogas capacity (m³/day), households served, pipeline length.</li>
+<li>Feedstock: type, origin, transport distance, contracts with farmers.</li>
+<li>Gas cleaning: desulfurization, drying, distribution pressure.</li>
+<li>Economics: tariff per m³ or per month, O&amp;M cost, other revenue (fertilizer), subsidies, payback.</li>
+<li>Institutions: owner (cooperative/village enterprise/company), community involvement, technician training.</li>
+<li>Digestate handling and sales.</li>
+<li>Safety and monitoring (SCADA, sensors).</li>
+<li>Social impact: health, cooking time, cleanliness, farmer income.</li>
+</ol>
+<h3>C. Practical</h3>
+<ul>
+<li>Field clothing, closed shoes, hat, water, small rain jacket, halal snacks, motion-sickness tablets if needed. Bring a notebook to sketch the process flow diagram on site.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Replace LPG:</strong> Indonesia imports a large share of LPG and spends heavily on its subsidy; MoEMR pursues LPG substitution (city gas pipelines, DME, induction stoves, biogas). Centralized rural biogas fits this agenda.</li>
+<li><strong>Institution analogue:</strong> BUMDes/cooperatives, the Desa Mandiri Energi concept and MoEMR's rural energy programmes.</li>
+<li><strong>Target regions:</strong> livestock areas in East Java, NTT, Sumatra.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>What is the household tariff versus LPG/firewood cost, and are households willing to pay?</li>
+<li>Who owns the pipeline and who is responsible when it leaks?</li>
+<li>What happens to supply in cold months when digester temperature drops?</li>
+<li>How were farmers persuaded to deliver manure on contract?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec6"><input type="checkbox" class="done" title="Mark as read"> Wednesday night (14 Oct) → for Thu, 15 Oct</h2>
+<p><strong>Tomorrow:</strong> Lecture 6: <em>Development &amp; Utilization of Geothermal Energy in China</em> (Prof. Sun Licheng, Sichuan University) · Lecture 7: <em>Hydrogen Energy Development History &amp; Future Outlook</em> (Tang Bo, Chengdu University of Technology).</p>
+<h3>A. Geothermal (~55 min): Indonesia is a major power here</h3>
+<ul>
+<li><strong>Classification:</strong> high temperature (&gt;150 °C, power), medium (90–150 °C), low (&lt;90 °C, direct use/heat pumps). Systems: <strong>hydrothermal</strong>, <strong>EGS</strong>, closed-loop/AGS, <strong>GSHP</strong>, mid-deep borehole heat exchangers.</li>
+<li><strong>China:</strong> world leader in <strong>direct use</strong> (space heating, spas, agriculture) and heat pumps. Large power plants are limited, e.g., <strong>Yangbajing (Tibet)</strong> since 1977. Western Sichuan (Kangding, Litang, Batang) has a high-temperature belt; mid-deep geothermal heating in <strong>Xiong'an</strong>.</li>
+</ul>
+<h3>B. Hydrogen (~55 min)</h3>
+<ul>
+<li><strong>Colors:</strong> grey (reforming), black/brown (coal), blue (+CCS), <strong>green (electrolysis + renewables)</strong>, plus turquoise, yellow, white.</li>
+<li><strong>Electrolysers:</strong> <strong>ALK</strong> (mature, cheap), <strong>PEM</strong> (responsive, costly), <strong>SOEC</strong> (high efficiency, high temperature), <strong>AEM</strong> (emerging).</li>
+<li><strong>Value chain:</strong> production → compression/liquefaction (350/700 bar; −253 °C) → storage &amp; transport (pipeline, truck, <strong>ammonia</strong>, <strong>LOHC</strong>) → use (fuel cells/FCEV, steel and chemicals, storage).</li>
+<li><strong>China:</strong> largest hydrogen producer (~35 Mt/yr, mostly from coal); <strong>Hydrogen Industry Medium-Long Term Plan 2021–2035</strong>; big green hydrogen projects in Xinjiang and Inner Mongolia; Sichuan/Chengdu uses hydro-based hydrogen.</li>
+<li><strong>Issues:</strong> cost (US$/kg), round-trip efficiency (~30–40%), safety, infrastructure.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Geothermal:</strong> potential ~23–24 GW (about the second largest in the world) with ~2.6 GW installed, second after the US. Fields: Kamojang, Salak, Darajat, Wayang Windu, Dieng, Sarulla, Lahendong; players: Pertamina Geothermal Energy, Geo Dipa. MoEMR tools: government exploration drilling, risk-mitigation and financing facilities (e.g., the Geothermal Fund via PT SMI), tariff setting and forest-area permitting reforms. Barriers: exploration risk, upfront cost, tariff, permits.</li>
+<li><strong>Contrast:</strong> China uses geothermal mainly for heat; Indonesia almost only for power. <strong>Direct-use</strong> (agro-drying, tourism, heating) is a largely untapped opportunity.</li>
+<li><strong>Hydrogen:</strong> National Hydrogen Strategy (2023) and Roadmap; PLN and Pertamina pilots (e.g., geothermal-based at Ulubelu); export potential.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>What deep-drilling and EGS technologies has China tested, and at what cost per metre and per kW?</li>
+<li>How does China de-risk exploration (state drilling, insurance) compared with Indonesia's resource risk mitigation?</li>
+<li>How could low-temperature geothermal serve agro-processing and tourism in Indonesian villages?</li>
+<li>When does green hydrogen become competitive, and which sectors first (ammonia, fertilizer, steel, heavy transport)?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec7"><input type="checkbox" class="done" title="Mark as read"> Thursday night (15 Oct) → for Fri, 16 Oct</h2>
+<p><strong>Tomorrow:</strong> Field Visit 3: <em>Zhongzi Technology (hydrogen, energy storage, power batteries, new PV materials), HiTech West Zone Chengdu</em> · Field Visit 4: <em>Agricultural Waste Anaerobic Conversion &amp; Green Energy Technology Platform, BIOMA Key Laboratory</em> (Ma Shichun).</p>
+<h3>A. Energy storage &amp; batteries (~45 min)</h3>
+<ul>
+<li><strong>Why:</strong> solar/wind are intermittent, so storage, smart grids and flexibility are needed.</li>
+<li><strong>Technologies:</strong> <strong>LFP</strong> (safe, cheap, dominant in China), <strong>NMC/NCA</strong> (high energy density), <strong>sodium-ion</strong> (emerging), <strong>vanadium flow</strong>, <strong>pumped hydro</strong> (dominant by capacity), compressed air, thermal.</li>
+<li><strong>Terms:</strong> kWh/MWh vs kW/MW, C-rate, round-trip efficiency, cycle life, <strong>BMS</strong>, <strong>PCS</strong>, <strong>EMS</strong>. EV batteries: cell → module → pack; second-life and recycling.</li>
+</ul>
+<h3>B. New PV materials (~20 min)</h3>
+<ul>
+<li><strong>PERC → TOPCon → HJT → perovskite/tandem</strong> (lab efficiency 30%+). Monocrystalline silicon dominates; perovskite stability is the challenge.</li>
+<li><strong>Tip:</strong> read the company profile on its official website before visiting and pick 3 products you want to see.</li>
+</ul>
+<h3>C. Anaerobic conversion at the BIOMA lab (~35 min)</h3>
+<ul>
+<li>Revisit Tuesday's biogas material with focus on <strong>agricultural waste</strong>.</li>
+<li><strong>Research concepts:</strong> <em>pretreatment</em> (physical, chemical, biological) to break down lignocellulose; <strong>co-digestion</strong>; <strong>BMP test</strong>; kinetics; process control and inhibitor removal; <strong>biohydrogen</strong>; biochar; microbiome (methanogenic archaea).</li>
+<li>Note equipment and measurement methods on the platform.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Batteries:</strong> Indonesia's nickel downstreaming (hilirisasi) aims at an EV battery ecosystem; MoEMR supports EV charging infrastructure and the battery-swap/storage agenda. Solar + battery hybrids are central to MoEMR's electrification of 3T (frontier, outermost, least-developed) islands and diesel replacement.</li>
+<li><strong>Research gap:</strong> MoEMR's research agencies (e.g., Lemigas, P3TEK/BRIN partnership) could use BIOMA as a model for joint pilot platforms.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>How does LFP's cost curve change the business case for island microgrids in the tropics (heat, humidity)?</li>
+<li>What is the methane yield (Nm³/t VS) from different feedstocks, and how does it scale from lab to commercial plant?</li>
+<li>Could BIOMA train Indonesian technicians/researchers (MoU, joint lab, scholarship)?</li>
+<li>What are the end-of-life rules for batteries in China, and are they enforced?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec8"><input type="checkbox" class="done" title="Mark as read"> Friday night (16 Oct) → for Sat, 17 Oct</h2>
+<p><strong>Tomorrow:</strong> Field Visit 5: <em>Waste-to-Energy Incineration Plant, Xinjin District, Chengdu</em> (Sichuan Hainuoer Eco-Environmental Tech) · Cultural Experience 2: <em>Chengdu Planning Exhibition Hall</em>.</p>
+<h3>A. Waste-to-Energy incineration (~60 min)</h3>
+<ul>
+<li><strong>Process:</strong> waste reception (bunker, mixing) → <strong>moving-grate</strong> furnace at <strong>≥850 °C with ≥2 s residence time</strong> → boiler → turbine &amp; generator → <strong>flue-gas treatment</strong> → ash.</li>
+<li><strong>Emission control:</strong> <strong>SNCR</strong> denitrification, semi-dry scrubber, <strong>activated carbon injection</strong>, <strong>bag filter</strong>, online CEMS. Focus: dioxins/furans, NOx, SO₂, HCl, heavy metals.</li>
+<li><strong>Residues:</strong> bottom ash (construction material); <strong>fly ash = hazardous waste</strong>; leachate treatment.</li>
+<li><strong>Key figures:</strong> Chinese MSW calorific value ~5–8 MJ/kg; ~400–600 kWh per tonne; typical plant 500–3,000 t/day.</li>
+<li><strong>China:</strong> world's largest WtE capacity (&gt;1 million t/day), built alongside <strong>waste sorting</strong> and publicly disclosed online emissions. Social issue: <em>NIMBY</em> opposition and transparency.</li>
+</ul>
+<h3>B. Chengdu Planning Exhibition Hall (~20 min)</h3>
+<ul>
+<li>"<strong>Park City</strong>" (公园城市) concept, <strong>Tianfu New Area</strong>, <strong>Chengdu–Chongqing Twin-City Economic Circle</strong>, metro and Tianfu airport, low-carbon green city.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>PSEL (waste-to-electricity):</strong> a presidential regulation (Perpres 35/2018, since superseded/updated, verify the current one) mandates acceleration in major cities; MoEMR sets the feed-in price and PLN's purchase obligation. Challenges: wet, unsorted waste, tipping fee, tariff, financing. Compare with <strong>RDF</strong> and landfill gas.</li>
+<li><strong>Contrast:</strong> China built sorting and strict emissions disclosure first; Indonesia's constraint is the bankability of the tipping fee and tariff.</li>
+<li><strong>IKN (Nusantara):</strong> planning lessons for green-city design and energy infrastructure.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>What are the tipping fee and electricity sales tariff, and who pays the gap?</li>
+<li>How is sorting enforced and how is dioxin controlled and publicly verified?</li>
+<li>How were nearby communities consulted, and what compensation was offered?</li>
+<li>How does Chengdu integrate energy planning into its Park City masterplan?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec9"><input type="checkbox" class="done" title="Mark as read"> Saturday night (17 Oct) → Sun, 18 Oct (Free Time) &amp; Monday preparation</h2>
+<p>Sunday is a <strong>free day</strong>. Use ~1.5 hours (Saturday night or Sunday morning) to:</p>
+<ol>
+<li><strong>Recap week one (40 min):</strong> merge the notes of 8 sessions into one "Technology Map":</li>
+</ol>
+<div class="tw"><table>
+<thead><tr><th>Technology</th><th>Principle</th><th>Status in China</th><th>Status/potential in Indonesia</th><th>Barriers</th><th>Action idea</th></tr></thead>
+<tbody>
+<tr><td>Biogas</td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>Biomass</td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>Geothermal</td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>Hydrogen</td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>WtE</td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr><td>Hydro</td><td></td><td></td><td></td><td></td><td></td></tr>
+</tbody></table></div>
+<ol start="2">
+<li><strong>Pre-read for Monday (45 min):</strong> see the next block.</li>
+<li><strong>Reflect and rest:</strong> write one project idea/lesson to take home; the coming days are packed.</li>
+</ol>
+<div class="q"><strong>💬 Reflection questions:</strong>
+<ul>
+<li>Which of the six technologies is the best "quick win" for your unit, and which is a long-term bet?</li>
+<li>Which Chinese enabling factor (state planning, local manufacturing, standards body) is missing in Indonesia?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec10"><input type="checkbox" class="done" title="Mark as read"> Sunday night (18 Oct) → for Mon, 19 Oct</h2>
+<p><strong>Tomorrow:</strong> Lecture 8: <em>Development &amp; Status of Solar PV Technology in China</em> · Lecture 9: <em>Development and Status Quo of Wind Power Technology in China</em> (both Huang Ze'ai, Southwest Petroleum University).</p>
+<h3>A. Solar PV (~55 min)</h3>
+<ul>
+<li><strong>Basics:</strong> photovoltaic effect; cell → module → string → inverter → grid. Units: <strong>Wp/kWp/MWp</strong>, <strong>performance ratio</strong>, <strong>capacity factor</strong> (~15–25%), <strong>degradation</strong> (~0.4–0.5%/yr), <strong>DC/AC ratio</strong>, <strong>MPPT</strong>, tracker vs fixed-tilt.</li>
+<li><strong>Cells:</strong> PERC, <strong>TOPCon (currently dominant)</strong>, HJT, perovskite/tandem. Commercial module efficiency ~22–24%.</li>
+<li><strong>China:</strong> &gt;80% of global PV supply chain; installed capacity above ~1,000 GW; steep price falls; <strong>overcapacity</strong> and "anti-involution" (curbing price wars); curtailment and grid integration; models: <strong>utility-scale (desert/plateau)</strong>, <strong>distributed rooftop</strong>, <strong>agrivoltaics</strong>, <strong>floating PV</strong>.</li>
+</ul>
+<h3>B. Wind (~45 min)</h3>
+<ul>
+<li><strong>Basics:</strong> power ∝ v³; <strong>Betz limit 59.3%</strong>; power curve; <strong>cut-in/rated/cut-out</strong>; capacity factor onshore ~25–40%, offshore ~40–50%.</li>
+<li><strong>Technology:</strong> 3-blade HAWT; direct-drive vs gearbox; modern offshore 6–20 MW; monopile/jacket/floating foundations; micro-wind.</li>
+<li><strong>China:</strong> world's largest capacity (~500+ GW), centered in Inner Mongolia, Xinjiang and coasts; major OEMs (Goldwind, Envision, Mingyang). In Sichuan: <strong>Liangshan</strong> mountains.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Solar:</strong> huge theoretical potential (thousands of GW); floating PV <strong>Cirata</strong> (~192 MWp, among the largest in Southeast Asia); rooftop PV rules by ministerial regulation; the 100 GW solar plan (verify); constraints: TKDN, tariffs, grid and remote islands. Opportunity and risk: Chinese modules dominate imports, while Indonesia wants a local manufacturing base.</li>
+<li><strong>Wind:</strong> generally low wind speeds; <strong>Sidrap (75 MW)</strong> and <strong>Jeneponto (72 MW)</strong> in South Sulawesi; potential in NTT and South Java. Low-wind-speed turbines and hybrid wind-solar-battery for archipelagic areas.</li>
+<li><strong>Grid:</strong> MoEMR/PLN work on the green super-grid/interconnection concept and storage, comparable to China's West-to-East lines.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>What are PV LCOE (¥/kWh), EPC cost (¥/W) and the village rooftop PV policy?</li>
+<li>How is China managing overcapacity and curtailment, and what does it mean for module prices Indonesia imports?</li>
+<li>What module and mounting designs work in hot, humid, corrosive tropical conditions?</li>
+<li>How does China handle PV module recycling and local-content requirements?</li>
+<li>Are low-wind-speed turbine designs commercially viable for Indonesia?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec11"><input type="checkbox" class="done" title="Mark as read"> Monday night (19 Oct) → for Tue, 20 Oct</h2>
+<p><strong>Tomorrow:</strong> Flight to <strong>Kunming</strong> (Pu Xiaodong) · Weiju Osmanthus Hotel (4-star) · afternoon: <strong>personal arrangements</strong>.</p>
+<h3>A. Logistics (~20 min)</h3>
+<ul>
+<li>Prepare passport, tickets, packed luggage; confirm meeting time and pick-up point; check domestic baggage limits.</li>
+<li>Kunming: ~1,900 m altitude ("Spring City", 春城); thinner, cooler air; hydrate and bring a light jacket.</li>
+</ul>
+<h3>B. Yunnan background (~40 min)</h3>
+<ul>
+<li><strong>Yunnan:</strong> southwest province bordering Myanmar, Laos and Vietnam, <strong>China's gateway to Southeast/South Asia</strong>. China–Laos Railway opened December 2021.</li>
+<li><strong>Energy:</strong> hydro-dominant (Lancang/Mekong, Jinsha, Nu rivers), very high clean-energy share, a "West-to-East" source, base for <strong>green aluminium</strong>; fast solar and wind growth.</li>
+<li><strong>Rural Yunnan:</strong> solar water heaters, household biogas, PLTMH, village PV. Prepare for the 23 Oct session.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong> Yunnan's mountainous, multi-ethnic terrain resembles <strong>Eastern Indonesia</strong> (access, remoteness). Compare with MoEMR's programmes for 3T areas, e.g., PLTS/PLTMH electrification, "Light of Indonesia" (Indonesia Terang) and the electrification-ratio push (~99.x%, verify).</div>
+<div class="q"><strong>💬 Questions for yourself:</strong>
+<ul>
+<li>What are the three most important things you learned in Chengdu? (Material for your final report.)</li>
+<li>Does green aluminium suggest a model for Indonesian nickel/aluminium smelters powered by renewables (e.g., Kalimantan Utara hydro)?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec12"><input type="checkbox" class="done" title="Mark as read"> Tuesday night (20 Oct) → for Wed, 21 Oct</h2>
+<p><strong>Tomorrow:</strong> Field Visit 6: <em>PV Modules &amp; Arrays, Shilin Photovoltaic Power Station</em> (Pu Xiaodong) · Cultural Experience 3: <em>Shilin Scenic Area</em> (Stone Forest), Shilin Yi Autonomous County.</p>
+<h3>A. Observing a PV plant (~55 min), reuse Monday's PV concepts and add field aspects</h3>
+<ul>
+<li><strong>Components:</strong> modules, mounting structure, DC cables, <strong>combiner box</strong>, <strong>inverter</strong> (string/central), transformer, switchyard, SCADA, cleaning system, fencing &amp; drainage.</li>
+<li><strong>Observe:</strong> module type and brand, module power, modules per string, tilt and azimuth, row spacing, cleaning system, <strong>module temperature</strong>, weather handling (rain, high UV at altitude), security.</li>
+<li><strong>Ask for:</strong> capacity (MWp), annual output (GWh), <strong>capacity factor</strong>, PR, EPC cost (¥/W), selling tariff, project life, <strong>degradation</strong>, O&amp;M cost.</li>
+<li><strong>Local impact:</strong> land use, local jobs, agrivoltaics.</li>
+</ul>
+<h3>B. Shilin / Stone Forest (~15 min)</h3>
+<ul>
+<li><strong>Shilin (石林)</strong>: karst stone forest, part of <strong>South China Karst (UNESCO 2007)</strong>; Yi (Sani) culture, torch festival, Ashima legend. Energy development in karst/protected areas must respect the environment.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong> highland/karst PV (Dieng, NTT) and <strong>PV + battery</strong> for 3T areas. Compare land-clearance and permitting for large solar in Indonesia (forest-area permits, community land) with China's siting on barren land and plateaus.</div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>How was the site chosen and how were land rights and local community benefits handled?</li>
+<li>What is the measured soiling loss and cleaning cost in this climate?</li>
+<li>How does this plant handle grid curtailment in a hydro-dominated province?</li>
+<li>How is protection of the scenic/karst environment ensured?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec13"><input type="checkbox" class="done" title="Mark as read"> Wednesday night (21 Oct) → for Thu, 22 Oct</h2>
+<p><strong>Tomorrow:</strong> Cultural Experience 4: <em>Kunming New Luosiwan International Trade City</em> · afternoon: <em>free time</em>.</p>
+<h3>A. Trade context (~30 min)</h3>
+<ul>
+<li><strong>Luosiwan (螺蛳湾):</strong> a large wholesale hub in Kunming linking China with <strong>ASEAN</strong> and South Asia. Background: <strong>RCEP</strong>, <strong>ASEAN–China FTA</strong>, <strong>Belt and Road</strong>, China–Laos railway.</li>
+<li><strong>Business opportunities:</strong> Indonesian agricultural/plantation products, coffee, spices, fisheries, halal products; conversely renewable-energy equipment and agricultural machinery from China.</li>
+<li><strong>Shopping tips:</strong> bargaining is normal; check quality; beware of counterfeits; keep sellers' business cards.</li>
+</ul>
+<h3>B. Self-evaluation (~45 min), preparation for Friday</h3>
+<ul>
+<li>Compile all notes. Write the <strong>top 10 lessons</strong> and <strong>3 projects/actions</strong> to bring to Indonesia.</li>
+<li>Prepare <strong>questions</strong> and an <strong>Indonesian case</strong> for Friday's Yunnan session, especially rural energy.</li>
+</ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong> equipment trade is where MoEMR's TKDN (local content) policy meets Chinese supply; consider how to attract Chinese manufacturers to produce in Indonesia (technology transfer, joint ventures) rather than only import.</div>
+<div class="q"><strong>💬 Discussion prompts:</strong>
+<ul>
+<li>Which Chinese renewable equipment is most cost-effective for Indonesian villages, and what after-sales support exists across borders?</li>
+<li>How can quality standards (SNI, certification) protect buyers of imported energy equipment?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec14"><input type="checkbox" class="done" title="Mark as read"> Thursday night (22 Oct) → for Fri, 23 Oct</h2>
+<p><strong>Tomorrow:</strong> Case Study 2: <em>Rural Energy Development &amp; Practice in Yunnan</em> (Yan Song, Yunnan Rural Energy Administration Station) 9:00–11:00 · Closing Ceremony 11:00–12:00 · Farewell Banquet 12:00–13:00.</p>
+<h3>A. Rural energy (~60 min)</h3>
+<ul>
+<li><strong>Technologies:</strong> household &amp; communal biogas, solar water heaters, efficient/biomass stoves, PLTMH, village PV, pellets/briquettes.</li>
+<li><strong>Institution:</strong> the <strong>Rural Energy Station</strong> network at province/county level: extension, training, inspection, standards.</li>
+<li><strong>Focus questions:</strong> how does the station network work (staff, budget, tasks)? How are subsidies and household financing designed? How is sustainability (O&amp;M, village technician training) maintained? How does it combine with <strong>rural revitalization</strong> and poverty reduction?</li>
+</ul>
+<h3>B. Closing preparation (~30 min)</h3>
+<ul>
+<li>Prepare a short thank-you (simple Mandarin if possible: <em>"Fēicháng gǎnxiè!"</em> 非常感谢, <em>"Xièxie lǎoshī"</em> 谢谢老师).</li>
+<li>Prepare constructive impressions and feedback (one paragraph).</li>
+<li>Collect lecturers'/participants' contacts; take group photos.</li>
+<li>Draft a <strong>follow-up plan</strong>: your first 3 steps within 30 days of returning home.</li>
+</ul>
+<h3>C. Return logistics</h3>
+<ul><li>Departure 24 Oct (transfer to Kunming Changshui Airport). Check baggage rules (e.g., no large power banks in checked luggage).</li></ul>
+<div class="id"><strong>🇮🇩 Indonesia/MoEMR link:</strong>
+<ul>
+<li><strong>Institutional gap:</strong> Indonesia has agricultural extension workers, BUMDes, MoEMR/EBTKE programmes and Desa Mandiri Energi, but no dedicated, nationwide "rural energy station" network with technicians, inspection and standards. This is the key policy takeaway to evaluate for MoEMR's regional offices (provincial energy and mineral resources agencies) post-decentralization.</li>
+<li><strong>Possible adaptation:</strong> pair provincial ESDM offices with village technician training and an O&amp;M fund so that biogas, PLTMH and PV do not stall after handover.</li>
+</ul></div>
+<div class="q"><strong>💬 Discussion questions:</strong>
+<ul>
+<li>How many staff and what budget does a county-level station have, and who funds them (central vs local)?</li>
+<li>How does the station certify installers and enforce safety standards?</li>
+<li>What proportion of installed rural systems still work after 5–10 years, and what keeps them working?</li>
+<li>If Indonesia were to pilot one station-type unit, which province and which technology should it start with?</li>
+</ul></div>
+<hr>
+
+<h2 id="sec15"><input type="checkbox" class="done" title="Mark as read"> Appendix A: Quick Glossary (English, Indonesian, Chinese)</h2>
+<div class="tw"><table>
+<thead><tr><th>English</th><th>Indonesian</th><th>中文 (pinyin)</th></tr></thead>
+<tbody>
+<tr><td>Biogas</td><td>Biogas</td><td>沼气 (zhǎoqì)</td></tr>
+<tr><td>Biomass energy</td><td>Energi biomassa</td><td>生物质能 (shēngwùzhì néng)</td></tr>
+<tr><td>Anaerobic digestion</td><td>Pencernaan anaerobik</td><td>厌氧发酵 (yànyǎng fājiào)</td></tr>
+<tr><td>Digester</td><td>Digester/reaktor biogas</td><td>沼气池 (zhǎoqìchí)</td></tr>
+<tr><td>Digestate</td><td>Digestat</td><td>沼渣/沼液 (zhǎozhā / zhǎoyè)</td></tr>
+<tr><td>Geothermal</td><td>Panas bumi</td><td>地热 (dìrè)</td></tr>
+<tr><td>Hydrogen</td><td>Hidrogen</td><td>氢能 (qīng néng)</td></tr>
+<tr><td>Solar PV</td><td>PLTS/Fotovoltaik</td><td>光伏 (guāngfú)</td></tr>
+<tr><td>Wind power</td><td>Tenaga angin</td><td>风电 (fēngdiàn)</td></tr>
+<tr><td>Energy storage</td><td>Penyimpanan energi</td><td>储能 (chǔnéng)</td></tr>
+<tr><td>Waste-to-energy</td><td>Sampah jadi energi (PSEL)</td><td>垃圾焚烧发电 (lājī fénshāo fādiàn)</td></tr>
+<tr><td>Carbon neutrality</td><td>Netralitas karbon</td><td>碳中和 (tàn zhōnghé)</td></tr>
+<tr><td>Carbon peak</td><td>Puncak emisi</td><td>碳达峰 (tàn dáfēng)</td></tr>
+<tr><td>Ecological civilization</td><td>Peradaban ekologis</td><td>生态文明 (shēngtài wénmíng)</td></tr>
+<tr><td>Rural revitalization</td><td>Revitalisasi pedesaan</td><td>乡村振兴 (xiāngcūn zhènxīng)</td></tr>
+<tr><td>Halal</td><td>Halal</td><td>清真 (qīngzhēn)</td></tr>
+</tbody></table></div>
+
+<h2 id="sec16"><input type="checkbox" class="done" title="Mark as read"> Appendix B: Quick Formulas &amp; Figures</h2>
+<ul>
+<li><strong>Wind power:</strong> P = ½ · ρ · A · v³ · Cp (Cp ≤ 0.593).</li>
+<li><strong>Capacity factor:</strong> actual annual energy ÷ (capacity × 8,760 h).</li>
+<li><strong>PV energy:</strong> E ≈ kWp × peak sun hours/day × 365 × PR (PR ≈ 0.75–0.85).</li>
+<li><strong>Biogas → electricity:</strong> 1 m³ biogas (CH₄ ~60%) ≈ 1.5–2 kWh (genset efficiency ~30–38%).</li>
+<li><strong>Methane:</strong> heating value ~35.8 MJ/Nm³ (pure); 60% CH₄ biogas ≈ ~21.5 MJ/Nm³.</li>
+<li><strong>LCOE</strong> = (capital cost + lifetime O&amp;M) ÷ (total lifetime energy).</li>
+</ul>
+<hr>
+<p><em>Final tip:</em> consistency matters more than perfection. With 60–120 minutes each evening and 3-column notes, in 14 days you will have material for a report, a presentation and a project proposal for MoEMR. Good luck!</p>
+</article></main>
+<script>
+(function(){
+  var KEY='study-guide-green-energy-en-v1', doc=document.getElementById('doc');
+  var status=document.getElementById('status'), editBtn=document.getElementById('editBtn');
+  function syncChecks(){doc.querySelectorAll('input.done').forEach(function(c){c.checked?c.setAttribute('checked',''):c.removeAttribute('checked');});}
+  function store(){try{syncChecks();localStorage.setItem(KEY,doc.innerHTML);status.textContent='Saved ✓ '+new Date().toLocaleTimeString();}catch(e){status.textContent='Cannot autosave (use Download HTML)';}}
+  try{var s=localStorage.getItem(KEY);if(s){doc.innerHTML=s;}}catch(e){}
+  function buildJump(){
+    var sel=document.getElementById('jump');
+    while(sel.options.length>1)sel.remove(1);
+    doc.querySelectorAll('h2').forEach(function(h,i){
+      if(!h.id)h.id='sec'+i;
+      var o=document.createElement('option');o.value=h.id;o.textContent=h.textContent.trim().slice(0,60);sel.appendChild(o);
+    });
+  }
+  buildJump();
+  document.getElementById('jump').addEventListener('change',function(){if(this.value){var el=document.getElementById(this.value);if(el)el.scrollIntoView();this.value='';}});
+  editBtn.addEventListener('click',function(){
+    var on=!document.body.classList.contains('editing');
+    document.body.classList.toggle('editing',on);
+    doc.contentEditable=on?'true':'false';
+    editBtn.classList.toggle('on',on);
+    editBtn.textContent='✏️ Edit mode: '+(on?'ON':'OFF');
+    if(!on){buildJump();store();}
+  });
+  var t;doc.addEventListener('input',function(){clearTimeout(t);t=setTimeout(store,600);});
+  doc.addEventListener('change',store);
+  document.getElementById('saveBtn').addEventListener('click',function(){
+    syncChecks();
+    var wasEdit=doc.contentEditable;doc.removeAttribute('contenteditable');
+    var wasClass=document.body.classList.contains('editing');document.body.classList.remove('editing');
+    var html='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
+    if(wasClass)document.body.classList.add('editing');
+    if(wasEdit)doc.contentEditable=wasEdit;
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([html],{type:'text/html'}));
+    a.download='Study_Guide_Day-Before_Green_Energy_EN.html';
+    document.body.appendChild(a);a.click();a.remove();
+  });
+  document.getElementById('resetBtn').addEventListener('click',function(){
+    if(confirm('Discard all your changes and restore the original version of this file?')){
+      try{localStorage.removeItem(KEY);}catch(e){}
+      location.reload();
+    }
+  });
+})();
+</script>
+
+
+</body></html>
